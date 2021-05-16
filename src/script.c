@@ -21,10 +21,15 @@ static int script_thread_index(lua_State *);
 static int script_thread_newindex(lua_State *);
 static int script_wrk_lookup(lua_State *);
 static int script_wrk_connect(lua_State *);
+static int md5sum_wrk_md5sum(lua_State *);
+static int script_wrk_json_decode(lua_State *);
+static int script_wrk_json_encode(lua_State *);
 
 static void set_fields(lua_State *, int, const table_field *);
 static void set_field(lua_State *, int, char *, int);
 static int push_url_part(lua_State *, char *, struct http_parser_url *, enum http_parser_url_fields);
+static void script_json_decode_value(lua_State *, yyjson_val *);
+static yyjson_mut_val *script_json_encode_value(lua_State *, yyjson_mut_doc *);
 
 static const struct luaL_Reg addrlib[] = {
     { "__tostring", script_addr_tostring   },
@@ -72,12 +77,20 @@ lua_State *script_create(char *file, char *url, char **headers) {
         { NULL,      0,             NULL               },
     };
 
+    const table_field util_fields[] = {
+        { "md5sum",      LUA_TFUNCTION, md5sum_wrk_md5sum      },
+        { "json_decode", LUA_TFUNCTION, script_wrk_json_decode },
+        { "json_encode", LUA_TFUNCTION, script_wrk_json_encode },
+        { NULL,          0,             NULL                   },
+    };
+
     lua_getglobal(L, "wrk");
 
     set_field(L, 4, "scheme", push_url_part(L, url, &parts, UF_SCHEMA));
     set_field(L, 4, "host",   push_url_part(L, url, &parts, UF_HOST));
     set_field(L, 4, "port",   push_url_part(L, url, &parts, UF_PORT));
     set_fields(L, 4, fields);
+    set_fields(L, 4, util_fields);
 
     lua_getfield(L, 4, "headers");
     for (char **h = headers; *h; h++) {
@@ -471,6 +484,170 @@ static int script_wrk_connect(lua_State *L) {
         close(fd);
     }
     lua_pushboolean(L, connected);
+    return 1;
+}
+
+static int md5sum_wrk_md5sum(lua_State *L) {
+    const char *data = lua_tostring(L, -1);
+    size_t n = strlen(data);
+    u_char md5[32];
+    md5sum_hex(data, n, md5);
+    lua_pushlstring(L, (const char *)md5, sizeof(md5));
+    return 1;
+}
+
+static void script_json_decode_object(lua_State *L, yyjson_val *root) {
+    size_t idx, max;
+    yyjson_val *key, *val;
+    
+    yyjson_obj_foreach(root, idx, max, key, val) {
+        lua_pushstring(L, yyjson_get_str(key));
+        script_json_decode_value(L, val);
+        lua_settable(L, -3);
+    }
+}
+
+static void script_json_decode_array(lua_State *L, yyjson_val *root) {
+    size_t idx, max;
+    yyjson_val *val;
+    
+    yyjson_arr_foreach(root, idx, max, val) {
+        script_json_decode_value(L, val);
+        lua_rawseti(L, -2, idx + 1);
+    }
+}
+
+static void script_json_decode_value(lua_State *L, yyjson_val *val) {
+    switch (yyjson_get_type(val)) {
+        case YYJSON_TYPE_NULL:
+            lua_pushnil(L);
+            break;
+        case YYJSON_TYPE_BOOL:
+            lua_pushboolean(L, yyjson_get_bool(val));
+            break;
+        case YYJSON_TYPE_NUM:
+            if (yyjson_is_real(val))
+                lua_pushnumber(L, yyjson_get_real(val));
+            else if (yyjson_is_int(val))
+                lua_pushnumber(L, (lua_Number)yyjson_get_int(val));
+            else if (yyjson_is_uint(val))
+                lua_pushnumber(L, (lua_Number)yyjson_get_uint(val));
+            break;
+        case YYJSON_TYPE_STR:
+            lua_pushstring(L, yyjson_get_str(val));
+            break;
+        case YYJSON_TYPE_OBJ:
+            lua_newtable(L);
+            script_json_decode_object(L, val);
+            break;
+        case YYJSON_TYPE_ARR:
+            lua_newtable(L);
+            script_json_decode_array(L, val);
+            break;
+        default:
+            luaL_error(L, "unknown value type: %s", yyjson_get_type_desc(val));
+            break;
+    }
+}
+
+static int script_wrk_json_decode(lua_State *L) {
+    const char *data = lua_tostring(L, -1);
+
+    yyjson_read_err err;
+    yyjson_doc *doc = yyjson_read_opts((char *)data, strlen(data), 0, NULL, &err);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+
+    if (!doc)
+        return luaL_error(L, "decode error: %s code:" PRIu32 "at position: %zu\n", err.msg, err.code, err.pos);
+
+    script_json_decode_value(L, root);
+    yyjson_doc_free(doc);
+
+    return 1;
+}
+
+static bool script_json_is_array(lua_State *L) {
+    int is_array = true;
+    int top = lua_gettop(L);
+    int idx = 1;
+
+    for (lua_pushnil(L); lua_next(L, -2); lua_pop(L, 1), idx++) {
+        if (!lua_isnumber(L, -2)) {
+            is_array = false;
+            break;
+        }
+        if (lua_tointeger(L, -2) != idx) {
+            is_array = false;
+            break;
+        }
+    }
+
+    lua_settop(L, top);
+
+    // TODO, empty tables is array or object?
+    // if (idx == 1)
+    //     is_array = false;
+
+    return is_array;
+}
+
+static yyjson_mut_val *script_json_encode_array(lua_State *L, yyjson_mut_doc *doc) {
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (lua_pushnil(L); lua_next(L, -2); lua_pop(L, 1))
+        yyjson_mut_arr_append(arr, script_json_encode_value(L, doc));
+    return arr;
+}
+
+static yyjson_mut_val *script_json_encode_object(lua_State *L, yyjson_mut_doc *doc) {
+    yyjson_mut_val *obj = yyjson_mut_obj(doc);
+    for (lua_pushnil(L); lua_next(L, -2); lua_pop(L, 2)) {
+        yyjson_mut_val *val = script_json_encode_value(L, doc);
+        lua_pushvalue(L, -2);
+        yyjson_mut_val *key = script_json_encode_value(L, doc);
+        yyjson_mut_obj_add(obj, key, val);
+    }
+    return obj;
+}
+
+static yyjson_mut_val* script_json_encode_value(lua_State *L, yyjson_mut_doc *doc) {
+    switch (lua_type(L, -1)) {
+        case LUA_TBOOLEAN:
+            return yyjson_mut_bool(doc, lua_toboolean(L, -1));
+        case LUA_TNIL:
+            return yyjson_mut_null(doc);
+        case LUA_TNUMBER: {
+            lua_Number n = lua_tonumber(L, -1);
+            if (n == (int64_t)n)
+                return yyjson_mut_int(doc, (int64_t)n);
+            else if (n == (uint64_t)n)
+                return yyjson_mut_uint(doc, (uint64_t)n);
+            return yyjson_mut_real(doc, n);
+        }
+        case LUA_TSTRING:
+            return yyjson_mut_str(doc, lua_tostring(L, -1));
+        case LUA_TTABLE: {
+            if (script_json_is_array(L))
+              return script_json_encode_array(L, doc);
+            else
+              return script_json_encode_object(L, doc);
+        }
+    }
+    return yyjson_mut_null(doc);
+}
+
+static int script_wrk_json_encode(lua_State *L) {
+    yyjson_write_err err;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = script_json_encode_value(L, doc);
+
+    yyjson_mut_doc_set_root(doc, root);
+    const char *data = yyjson_mut_write_opts(doc, 0, NULL, NULL, &err);
+    if (!data)
+        return luaL_error(L, "encode error: %s code:" PRIu32, err.msg, err.code);
+
+    lua_pushstring(L, data);
+    yyjson_mut_doc_free(doc);
+
     return 1;
 }
 

@@ -15,6 +15,8 @@
 #include "stats.h"
 #include "ae.h"
 #include "http_parser.h"
+#include "md5.h"
+#include "yyjson.h"
 
 #define RECVBUF  8192
 
