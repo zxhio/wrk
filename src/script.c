@@ -21,9 +21,11 @@ static int script_thread_index(lua_State *);
 static int script_thread_newindex(lua_State *);
 static int script_wrk_lookup(lua_State *);
 static int script_wrk_connect(lua_State *);
-static int md5sum_wrk_md5sum(lua_State *);
-static int script_wrk_json_decode(lua_State *);
-static int script_wrk_json_encode(lua_State *);
+static int script_md5sum(lua_State *);
+static int script_md5sumhexa(lua_State *);
+static int script_json_decode(lua_State *);
+static int script_json_encode(lua_State *);
+static int script_json_handle_empty_table(lua_State *);
 
 static void set_fields(lua_State *, int, const table_field *);
 static void set_field(lua_State *, int, char *, int);
@@ -50,6 +52,18 @@ static const struct luaL_Reg threadlib[] = {
     { NULL,         NULL                   }
 };
 
+static const struct luaL_Reg jsonlib[] = {
+    {"encode", script_json_encode},
+    {"decode", script_json_decode},
+    {"encode_empty_table_as_object", script_json_handle_empty_table},
+    {NULL, NULL}};
+
+static const struct luaL_Reg md5lib[] = {
+    { "sum",     script_md5sum     },
+    { "sumhexa", script_md5sumhexa },
+    { NULL,      NULL              }
+};
+
 lua_State *script_create(char *file, char *url, char **headers) {
     lua_State *L = luaL_newstate();
     luaL_openlibs(L);
@@ -61,6 +75,8 @@ lua_State *script_create(char *file, char *url, char **headers) {
     luaL_register(L, NULL, statslib);
     luaL_newmetatable(L, "wrk.thread");
     luaL_register(L, NULL, threadlib);
+    luaL_register(L, "json", jsonlib);
+    luaL_register(L, "md5", md5lib);
 
     struct http_parser_url parts = {};
     script_parse_url(url, &parts);
@@ -77,31 +93,23 @@ lua_State *script_create(char *file, char *url, char **headers) {
         { NULL,      0,             NULL               },
     };
 
-    const table_field util_fields[] = {
-        { "md5sum",      LUA_TFUNCTION, md5sum_wrk_md5sum      },
-        { "json_decode", LUA_TFUNCTION, script_wrk_json_decode },
-        { "json_encode", LUA_TFUNCTION, script_wrk_json_encode },
-        { NULL,          0,             NULL                   },
-    };
-
     lua_getglobal(L, "wrk");
 
-    set_field(L, 4, "scheme", push_url_part(L, url, &parts, UF_SCHEMA));
-    set_field(L, 4, "host",   push_url_part(L, url, &parts, UF_HOST));
-    set_field(L, 4, "port",   push_url_part(L, url, &parts, UF_PORT));
-    set_fields(L, 4, fields);
-    set_fields(L, 4, util_fields);
+    set_field(L, 6, "scheme", push_url_part(L, url, &parts, UF_SCHEMA));
+    set_field(L, 6, "host",   push_url_part(L, url, &parts, UF_HOST));
+    set_field(L, 6, "port",   push_url_part(L, url, &parts, UF_PORT));
+    set_fields(L, 6, fields);
 
-    lua_getfield(L, 4, "headers");
+    lua_getfield(L, 6, "headers");
     for (char **h = headers; *h; h++) {
         char *p = strchr(*h, ':');
         if (p && p[1] == ' ') {
             lua_pushlstring(L, *h, p - *h);
             lua_pushstring(L, p + 2);
-            lua_settable(L, 5);
+            lua_settable(L, 7);
         }
     }
-    lua_pop(L, 5);
+    lua_pop(L, 7);
 
     if (file && luaL_dofile(L, file)) {
         const char *cause = lua_tostring(L, -1);
@@ -500,7 +508,16 @@ static int script_wrk_connect(lua_State *L) {
     return 1;
 }
 
-static int md5sum_wrk_md5sum(lua_State *L) {
+static int script_md5sum(lua_State *L) {
+    const char *data = lua_tostring(L, -1);
+    size_t n = strlen(data);
+    u_char md5[16];
+    md5sum(data, n, md5);
+    lua_pushlstring(L, (const char *)md5, sizeof(md5));
+    return 1;
+}
+
+static int script_md5sumhexa(lua_State *L) {
     const char *data = lua_tostring(L, -1);
     size_t n = strlen(data);
     u_char md5[32];
@@ -563,7 +580,7 @@ static void script_json_decode_value(lua_State *L, yyjson_val *val) {
     }
 }
 
-static int script_wrk_json_decode(lua_State *L) {
+static int script_json_decode(lua_State *L) {
     const char *data = lua_tostring(L, -1);
 
     yyjson_read_err err;
@@ -571,7 +588,8 @@ static int script_wrk_json_decode(lua_State *L) {
     yyjson_val *root = yyjson_doc_get_root(doc);
 
     if (!doc)
-        return luaL_error(L, "decode error: %s code:" PRIu32 "at position: %zu\n", err.msg, err.code, err.pos);
+        return luaL_error(L, "decode error: %s code:" PRIu32 "at position: %zu\n",
+                        err.msg, err.code, err.pos);
 
     script_json_decode_value(L, root);
     yyjson_doc_free(doc);
@@ -597,9 +615,13 @@ static bool script_json_is_array(lua_State *L) {
 
     lua_settop(L, top);
 
-    // TODO, empty tables is array or object?
-    // if (idx == 1)
-    //     is_array = false;
+    if (idx == 1) {
+        lua_getglobal(L, "encode_empty_table_as_object");
+        bool as_object = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+        if (as_object)
+            is_array = false;
+    }
 
     return is_array;
 }
@@ -648,7 +670,7 @@ static yyjson_mut_val* script_json_encode_value(lua_State *L, yyjson_mut_doc *do
     return yyjson_mut_null(doc);
 }
 
-static int script_wrk_json_encode(lua_State *L) {
+static int script_json_encode(lua_State *L) {
     yyjson_write_err err;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = script_json_encode_value(L, doc);
@@ -692,6 +714,12 @@ void script_copy_value(lua_State *src, lua_State *dst, int index) {
         default:
             luaL_error(src, "cannot transfer '%s' to thread", luaL_typename(src, index));
     }
+}
+
+static int script_json_handle_empty_table(lua_State *L) {
+    lua_pushboolean(L, true);
+    lua_setglobal(L, "encode_empty_table_as_object");
+    return 1;
 }
 
 int script_parse_url(char *url, struct http_parser_url *parts) {
