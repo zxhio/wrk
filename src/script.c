@@ -195,6 +195,15 @@ void script_response(lua_State *L, int status, buffer *headers, buffer *body) {
     buffer_reset(body);
 }
 
+bool script_stream_response(lua_State *L, const char *data, size_t n){
+    lua_getglobal(L, "stream_response");
+    lua_pushlstring(L, data, n);
+    lua_call(L, 1, 1);
+    bool ok = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    return ok;
+}
+
 bool script_is_function(lua_State *L, char *name) {
     lua_getglobal(L, name);
     bool is_function = lua_isfunction(L, -1);
@@ -208,6 +217,10 @@ bool script_is_static(lua_State *L) {
 
 bool script_want_response(lua_State *L) {
     return script_is_function(L, "response");
+}
+
+bool script_want_stream_response(lua_State *L) {
+    return script_is_function(L, "stream_response");
 }
 
 bool script_has_delay(lua_State *L) {

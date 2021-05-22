@@ -25,6 +25,8 @@
 #include "units.h"
 #include "zmalloc.h"
 
+typedef bool (*response_complete_func)(connection *c, size_t n);
+
 struct config;
 
 static void *thread_main(void *);
@@ -37,7 +39,9 @@ static void socket_connected(aeEventLoop *, int, void *, int);
 static void socket_writeable(aeEventLoop *, int, void *, int);
 static void socket_readable(aeEventLoop *, int, void *, int);
 
-static int response_complete(http_parser *);
+bool stream_response_complete(connection *, size_t);
+bool http_response_complete(connection *, size_t);
+static int message_complete(http_parser *);
 static int header_field(http_parser *, const char *, size_t);
 static int header_value(http_parser *, const char *, size_t);
 static int response_body(http_parser *, const char *, size_t);

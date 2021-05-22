@@ -60,7 +60,11 @@
 
   wrk contains code from a number of open source projects including the
   'ae' event loop from redis, the nginx/joyent/node.js 'http-parser',
-  and Mike Pall's LuaJIT. Please consult the NOTICE file for licensing
+  and Mike Pall's LuaJIT.
+  
+  unofficial code including the nginx/md5 module and json module yyjson@https://github.com/ibireme/yyjson/commit/31313e8c15e3c221c7452fd99bf7fdf89b6d92c1.
+
+  Please consult the NOTICE file for licensing
   details.
 
 ## Cryptography Notice

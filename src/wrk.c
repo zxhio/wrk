@@ -10,6 +10,7 @@ static struct config {
     uint64_t threads;
     uint64_t timeout;
     uint64_t pipeline;
+    bool     stream;
     bool     delay;
     bool     dynamic;
     bool     latency;
@@ -32,8 +33,10 @@ static struct sock sock = {
 };
 
 static struct http_parser_settings parser_settings = {
-    .on_message_complete = response_complete
+    .on_message_complete = message_complete
 };
+
+static response_complete_func response_complete;
 
 static volatile sig_atomic_t stop = 0;
 
@@ -110,10 +113,18 @@ int main(int argc, char **argv) {
         script_init(L, t, argc - optind, &argv[optind]);
 
         if (i == 0) {
-            cfg.pipeline = script_verify_request(t->L);
             cfg.dynamic  = !script_is_static(t->L);
             cfg.delay    = script_has_delay(t->L);
-            if (script_want_response(t->L)) {
+            cfg.stream   = script_want_stream_response(t->L);
+
+            if (cfg.stream) {
+                response_complete = stream_response_complete;
+            } else {
+                cfg.pipeline = script_verify_request(t->L);
+                response_complete = http_response_complete;
+            }
+
+            if (script_want_response(t->L) || cfg.stream) {
                 parser_settings.on_header_field = header_field;
                 parser_settings.on_header_value = header_value;
                 parser_settings.on_body         = response_body;
@@ -321,7 +332,7 @@ static int response_body(http_parser *parser, const char *at, size_t len) {
     return 0;
 }
 
-static int response_complete(http_parser *parser) {
+static int message_complete(http_parser *parser) {
     connection *c = parser->data;
     thread *thread = c->thread;
     uint64_t now = time_us();
@@ -357,6 +368,36 @@ static int response_complete(http_parser *parser) {
 
   done:
     return 0;
+}
+
+bool http_response_complete(connection *c, size_t n) {
+    if (http_parser_execute(&c->parser, &parser_settings, c->buf, n) != n)
+        return false;
+    if (n == 0 && !http_body_is_final(&c->parser))
+        return false;
+    return true;
+}
+
+bool stream_response_complete(connection *c, size_t n) {
+    uint64_t now = time_us();
+    thread *thread = c->thread;
+
+    thread->complete++;
+    thread->requests++;
+
+    if (!script_stream_response(thread->L, c->buf, n))
+        thread->errors.status++;
+
+    if (!stats_record(statistics.latency, now - c->start))
+        thread->errors.timeout++;
+
+    c->delayed = cfg.delay;
+    aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
+
+    if (n == 0)
+        reconnect_socket(thread, c);
+
+    return true;
 }
 
 static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
@@ -434,8 +475,8 @@ static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
             case RETRY: return;
         }
 
-        if (http_parser_execute(&c->parser, &parser_settings, c->buf, n) != n) goto error;
-        if (n == 0 && !http_body_is_final(&c->parser)) goto error;
+        if (!response_complete(c, n))
+            goto error;
 
         c->thread->bytes += n;
     } while (n == RECVBUF && sock.readable(c) > 0);
@@ -527,8 +568,20 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
 
     if (optind == argc || !cfg->threads || !cfg->duration) return -1;
 
-    if (!script_parse_url(argv[optind], parts)) {
-        fprintf(stderr, "invalid URL: %s\n", argv[optind]);
+    // don't free the space by wrk
+    // make up scheme
+    size_t url_len = strlen(argv[optind]) + 8;
+    char *complete_url = zmalloc(sizeof(char) * url_len);
+    memset(complete_url, 0, url_len);
+    if (strncmp(argv[optind], "http://", 7) && strncmp(argv[optind], "https://", 8)) {
+        memcpy(complete_url, "http://", 7);
+        memcpy(complete_url + 7, argv[optind], strlen(argv[optind]));
+    } else {
+        memcpy(complete_url, argv[optind], strlen(argv[optind]));
+    }
+
+    if (!script_parse_url(complete_url, parts)) {
+        fprintf(stderr, "invalid URL: %s\n", complete_url);
         return -1;
     }
 
@@ -537,7 +590,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
         return -1;
     }
 
-    *url    = argv[optind];
+    *url = complete_url;
     *header = NULL;
 
     return 0;
